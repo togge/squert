@@ -30,34 +30,47 @@ if {[file exists $CONFIG]} {
     set VERSION  $configArray(sgVer)
     set SERVER   $configArray(sgHost)
     set PORT     $configArray(sgPort)
+    set PCAP_DIR $configArray(pcapDirectory)
 } else {
     puts "I could not find a confguration file"
     exit 1
 }
 
-if { $argc == 8 } {
-    set USR [lindex $argv 0]
-    set SEN [lindex $argv 1]
-    set TS  [lindex $argv 2]
-    set SID [lindex $argv 3]
-    set SIP [lindex $argv 4]
-    set DIP [lindex $argv 5]
-    set SPT [lindex $argv 6]
-    set DPT [lindex $argv 7]
+set TYPE [lindex $argv 0]
+if { $TYPE == "transcript" } {
+    if { $argc == 9 } {
+        set USR [lindex $argv 1]
+        set SEN [lindex $argv 2]
+        set TS  [lindex $argv 3]
+        set SID [lindex $argv 4]
+        set SIP [lindex $argv 5]
+        set DIP [lindex $argv 6]
+        set SPT [lindex $argv 7]
+        set DPT [lindex $argv 8]
+    } else {
+        puts "ERROR: Not enough arguments for transcript request"
+        exit 1
+    }
+} elseif { $TYPE == "pcap" } {
+    if { $argc == 10 } {
+        set USR [lindex $argv 1]
+        set SEN [lindex $argv 2]
+        set TS  [lindex $argv 3]
+        set SID [lindex $argv 4]
+        set SIP [lindex $argv 5]
+        set DIP [lindex $argv 6]
+        set SPT [lindex $argv 7]
+        set DPT [lindex $argv 8]
+        set PRT [lindex $argv 9]
+    } else {
+        puts "ERROR: Not enough arguments for pcap request"
+        exit 1
+    }
 } else {
     puts "ERROR: Not enough arguments"
     exit 1
 }
 
-set eventInfo "\"$SEN\" \"$TS\" $SID $SIP $DIP $SPT $DPT"
-
-# Now verify
-if { ![regexp -expanded { ^\".+\"\s\"\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\:\d{2}\"\s\d+\s\d+\.\d+\.\d+\.\d+\s\d+\.\d+\.\d+\.\d+\s\d+\s\d+$ } $eventInfo match] } {
-
-    puts "ERROR: Arguments failed logic tests"
-    exit 1
-
-}
 
 #########################################################################
 # Package/Extension Requirements
@@ -112,101 +125,122 @@ proc SendToSguild { socketID message } {
 
 }
 
+# Connect to Sguild
+proc ConnectToSguild { } {
+    global SERVER PORT USR PWD VERSION
+
+    # Try to connect to sguild
+    if [catch {socket $SERVER $PORT} socketID ] {
+
+        # Exit on fail.
+        return -code error "ERROR: Connection failed"
+    }
+
+    # Successfully connected
+    fconfigure $socketID -buffering line
+
+    # Check version compatibality
+    if [catch {gets $socketID} serverVersion] {
+
+        # Caught an unknown error
+        catch {close $socketID}
+        return -code error "ERROR: $serverVersion"
+    }
+
+    if { $serverVersion == "Connection Refused." } {
+
+        # Connection refused error
+        catch {close $socketID}
+        return -code error "ERROR: $serverVersion"
+    } 
+
+    if { $serverVersion != $VERSION } {
+
+        # Mismatched versions
+        catch {close $socketID}
+        return -code error "ERROR: Mismatched versions.\nSERVER= ($serverVersion)\nCLIENT= ($VERSION)"
+    }
+
+    # Send the server our version info
+    SendToSguild $socketID [list VersionInfo $VERSION]
+
+    # SSL-ify the socket
+    if { [catch {tls::import $socketID -ssl2 false -ssl3 false -tls1 true } tlsError] } { 
+
+        catch {close $socketID}
+        return -code error "ERROR: $tlsError"
+    }
+
+    # Give SSL a sec
+    after 1000
+
+    # Send sguild a ping to confirm comms
+    SendToSguild $socketID "PING"
+    # Get the PONG
+    set INIT [gets $socketID]
+
+    #
+    # Auth starts here
+    #
+
+    # Authenticate with sguild
+    SendToSguild $socketID [list ValidateUser $USR $PWD]
+
+    # Get the response. Success will return the users ID and failure will send INVALID.
+    if { [catch {gets $socketID} authMsg] } { 
+
+        catch {close $socketID}
+        return -code error "ERROR: $authMsg"
+
+    }
+
+    set authResults [lindex $authMsg 1]
+    if { $authResults == "INVALID" } { 
+
+        catch {close $socketID}
+        return -code error "ERROR: Authentication failed."
+
+    }
+
+    return $socketID
+
+}
+
+
+
+
 #########################################################################
 # Main
 #########################################################################
 
-flush stdout
-
-# Try to connect to sguild
-if [catch {socket $SERVER $PORT} socketID ] {
-
-    # Exit on fail.
-    puts "ERROR: Connection failed"
-    exit 1
-
-}
-
-# Successfully connected
-fconfigure $socketID -buffering line
-
-# Check version compatibality
-if [catch {gets $socketID} serverVersion] {
-
-    # Caught an unknown error
-    puts "ERROR: $serverVersion"
-    catch {close $socketID}
-    exit 1
-
-}
-
-if { $serverVersion == "Connection Refused." } {
-
-    # Connection refused error
-    puts "ERROR: $serverVersion"
-    catch {close $socketID}
-    exit 1
-
-} 
-
-if { $serverVersion != $VERSION } {
-
-    # Mismatched versions
-    catch {close $socketID}
-    puts "ERROR: Mismatched versions.\nSERVER= ($serverVersion)\nCLIENT= ($VERSION)"
-    exit 1
-
-}
-
-# Send the server our version info
-SendToSguild $socketID [list VersionInfo $VERSION]
-
-# SSL-ify the socket
-if { [catch {tls::import $socketID -ssl2 false -ssl3 false -tls1 true } tlsError] } { 
-
-    puts "ERROR: $tlsError"
-    exit 1
-
-}
-
-# Give SSL a sec
-after 1000
-
-# Send sguild a ping to confirm comms
-SendToSguild $socketID "PING"
-# Get the PONG
-set INIT [gets $socketID]
-
-#
-# Auth starts here
-#
-
 # Get users password
 set PWD [gets stdin]
 
-# Authenticate with sguild
-SendToSguild $socketID [list ValidateUser $USR $PWD]
+flush stdout
 
-# Get the response. Success will return the users ID and failure will send INVALID.
-if { [catch {gets $socketID} authMsg] } { 
-
-    puts "ERROR: $authMsg"
+if { [catch {ConnectToSguild} socketID] } {
+    puts "Could not connect to Sguild: $socketID"
     exit 1
-
-}
-
-set authResults [lindex $authMsg 1]
-if { $authResults == "INVALID" } { 
-
-    puts "ERROR: Authentication failed."
-    exit 1
-
 }
 
 # Send info to Sguild
-SendToSguild $socketID [list CliScript $eventInfo]
+if { $TYPE == "transcript" } {
+    set eventInfo "\"$SEN\" \"$TS\" $SID $SIP $DIP $SPT $DPT"
 
-set SESSION_STATE DEBUG
+    # Now verify
+    if { ![regexp -expanded { ^\".+\"\s\"\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\:\d{2}\"\s\d+\s\d+\.\d+\.\d+\.\d+\s\d+\.\d+\.\d+\.\d+\s\d+\s\d+$ } $eventInfo match] } {
+    
+        puts "ERROR: Arguments failed logic tests"
+        exit 1
+    
+    }
+
+    set SESSION_STATE DEBUG
+    SendToSguild $socketID [list CliScript $eventInfo]
+
+} elseif { $TYPE == "pcap" } {
+    SendToSguild $socketID [list WiresharkRequest $SEN $SID "$TS" $SIP $SPT $DIP $DPT $PRT 0]
+}
 
 # Xscript data comes in the format XscriptMainMsg window message
 # Tags are HDR, SRC, and DST. They are sent when state changes.
@@ -221,25 +255,48 @@ while { 1 } {
         exit 1
 
     }
-  
-    # Strip the command and faux winname from the msg
-    set data [lindex $msg 2]
 
-    switch -exact -- $data {
+    if { $TYPE == "pcap" } {
+        set cmd [lindex $msg 0]
+        if { $cmd == "PcapAvailable" } { 
+            set key [lindex $msg 1 ]
+            set filename [file tail [lindex $msg 2 ] ]
+            puts "filename: $PCAP_DIR/$filename"
+            set outFileID [open "$PCAP_DIR/$filename" w]
+            if { [catch {ConnectToSguild} dataSocketID] } {
+                puts "Could not connect to Sguild: $dataSocketID"
+                exit 1
+            }
+            SendToSguild $dataSocketID [list SendPcap $key]
+            fconfigure $dataSocketID -translation binary
+            fconfigure $outFileID -translation binary
+            if { [catch {fcopy $dataSocketID $outFileID} tmpError] } {
+                puts $tmpError
+                exit 1
+            }
+            catch {close $dataSocketID}
+            break
+        } 
+    } elseif { $TYPE == "transcript" } {
+        # Strip the command and faux winname from the msg
+        set data [lindex $msg 2]
 
-        HDR     { set SESSION_STATE HDR }
-        SRC     { set SESSION_STATE SRC }
-        DST     { set SESSION_STATE DST }
-        DEBUG   { set SESSION_STATE DEBUG }
-        DONE    { break }
-        ERROR   { set SESSION_STATE ERROR }
-        default { puts "${SESSION_STATE}: [lindex $msg 2]" }
+        switch -exact -- $data {
 
-    }
+            HDR     { set SESSION_STATE HDR }
+            SRC     { set SESSION_STATE SRC }
+            DST     { set SESSION_STATE DST }
+            DEBUG   { set SESSION_STATE DEBUG }
+            DONE    { break }
+            ERROR   { set SESSION_STATE ERROR }
+            default { puts "${SESSION_STATE}: [lindex $msg 2]" }
 
-    # Exit if agent returns no data after debug
-    if { $SESSION_STATE == "DEBUG" && $data == "" } {
-        break
+        }
+
+        # Exit if agent returns no data after debug
+        if { $SESSION_STATE == "DEBUG" && $data == "" } {
+            break
+        }
     }
 
 }
